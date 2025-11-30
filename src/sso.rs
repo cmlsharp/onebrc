@@ -7,7 +7,7 @@ use std::{
 const SMALL_SIZE: usize = std::mem::size_of::<AllocedSsoVec>();
 
 #[cfg(target_endian = "big")]
-compile_error!("This implementation assumes little-endian");
+compile_error!("this implementation assumes little endian");
 
 #[repr(C)]
 pub union SsoVec {
@@ -18,6 +18,7 @@ pub union SsoVec {
 impl SsoVec {
     #[inline]
     pub fn new(s: &[u8]) -> Self {
+        debug_assert!(s.len() < usize::MAX / 2);
         if s.len() < SMALL_SIZE {
             Self {
                 local: LocalSsoVec::new(s),
@@ -31,7 +32,7 @@ impl SsoVec {
     }
 
     fn is_local(&self) -> bool {
-        (unsafe { self.local.len }) & 1 == 1
+        ((unsafe { self.local.len }) >> 7) & 1 == 0
     }
 
     pub unsafe fn as_str_unchecked(&self) -> &str {
@@ -71,21 +72,21 @@ impl LocalSsoVec {
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ret.data.as_mut_ptr().cast(), data.len())
         };
-        ret.len = ((data.len() as u8) << 1) + 1;
+        ret.len = data.len() as u8;
         ret
     }
     fn len(&self) -> usize {
-        usize::from(self.len >> 1)
+        usize::from(self.len)
     }
 }
 
 impl AsRef<[u8]> for LocalSsoVec {
     fn as_ref(&self) -> &[u8] {
-        let len = self.len();
-        unsafe { std::slice::from_raw_parts(self.data.as_ptr().cast(), len) }
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr().cast(), self.len()) }
     }
 }
 
+#[repr(C)]
 struct AllocedSsoVec {
     ptr: *mut u8,
     len: usize,
@@ -95,15 +96,18 @@ impl AllocedSsoVec {
     fn new(alloc: Box<[u8]>) -> Self {
         let ptr = Box::into_raw(alloc);
         Self {
-            len: ptr.len(),
+            len: ptr.len() | (1 << (usize::BITS - 1)),
             ptr: ptr.cast(),
         }
+    }
+    fn len(&self) -> usize {
+        self.len & !(1 << (usize::BITS - 1))
     }
 }
 
 impl AsRef<[u8]> for AllocedSsoVec {
     fn as_ref(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len()) }
     }
 }
 
@@ -111,7 +115,7 @@ unsafe impl Send for AllocedSsoVec {}
 
 impl Drop for AllocedSsoVec {
     fn drop(&mut self) {
-        let slice_ptr = std::ptr::slice_from_raw_parts_mut(self.ptr, self.len);
+        let slice_ptr = std::ptr::slice_from_raw_parts_mut(self.ptr, self.len());
         drop(unsafe { Box::from_raw(slice_ptr) });
     }
 }

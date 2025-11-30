@@ -1,5 +1,4 @@
 // This code is adapted from (and is a strictly less general version of) [foldhash](https://docs.rs/foldhash/latest/foldhash/).
-//
 use std::hash::Hasher;
 
 #[derive(Default)]
@@ -37,8 +36,7 @@ impl FastHasher {
             s1 ^= u64::from_ne_bytes(bytes[len - 8..].try_into().unwrap());
         } else if len >= 4 {
             s0 ^= u32::from_ne_bytes(bytes[0..4].try_into().unwrap()) as u64;
-            s1 ^= u32::from_ne_bytes(unsafe { bytes[len - 4..].try_into().unwrap_unchecked() })
-                as u64;
+            s1 ^= u32::from_ne_bytes(bytes[len - 4..].try_into().unwrap()) as u64;
         } else if len > 0 {
             let lo = bytes[0];
             let mid = bytes[len / 2];

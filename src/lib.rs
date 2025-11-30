@@ -289,6 +289,7 @@ fn accumulate_records(
                 None => {
                     // the double hash here is annoying
                     // but it shouldn't happen often
+                    // hashbrown's entry_ref api is a nicer way to express this
                     records.insert(StationName::new(station), Record::from(temp));
                 }
             };
@@ -301,12 +302,8 @@ fn accumulate_records(
 pub fn process_file(path: &Path) -> io::Result<Vec<(StationName, Record)>> {
     let next_chunk = AtomicU64::new(0);
 
-    // just take the number of threads rayon defaults to in the global thread pool
     let workers = std::thread::available_parallelism().unwrap().get();
 
-    // it would be nice if i could instead just create an iterator over chunks
-    // and let rayon handle all the "worker pool" logic, but I can't conjure up a version
-    // of that that isn't slower than this
     let mut station_data = std::thread::scope(|scope| {
         let (tx, rx) = mpsc::sync_channel(workers);
         for _ in 0..workers {

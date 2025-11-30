@@ -1,0 +1,25 @@
+[package]
+name = "onebrc"
+version = "0.1.0"
+edition = "2024"
+panic = "abort"
+
+
+[profile.release]
+debug = true
+codegen-units = 1 # means i don't have to reason about inlining
+
+[dev-dependencies]
+criterion = "0.7.0"
+
+[[bin]]
+name = "onebrc"
+path = "src/main.rs"
+
+[lib]
+name = "onebrc"
+path = "src/lib.rs"
+
+[[bench]]
+name = "full_bench"
+harness = false

@@ -1,12 +1,13 @@
 #![feature(portable_simd)]
 #![feature(cold_path)]
+#![feature(iter_array_chunks)]
 
 use std::{
     cmp, fmt, fs, hint,
     io::{self, prelude::*},
     ops::AddAssign,
     path::Path,
-    simd::{LaneCount, SupportedLaneCount, prelude::*},
+    simd::prelude::*,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc,
@@ -21,74 +22,88 @@ mod sso;
 // + 5 for -xx.x
 const MAX_LINE_LEN: usize = 100 + 1 + 5;
 
-/// I use hashbrown::HashMap instead of the stl hashmap because it supports the
-/// entry_ref API
-/// ahash::AHasher is slower
-//use hashbrown::HashMap;
 type HashMap<K, V> = std::collections::HashMap<K, V, hasher::BuildFastHasher>;
 
 // used to set initial capacities for hash tables
 const INIT_CAPACITY: usize = 1024;
 
-// these are the number of lanes for newlines and semicolons respectively that seem to minimize
-// time
-// they are different because semicolons are searched for _within_ a line
-// so its usually a smaller window
-const NL_LANES: usize = 16;
-const SC_LANES: usize = 8;
-
 // small string optimization byte string
 pub type StationName = sso::SsoVec;
 
-fn find_newline(buffer: &[u8]) -> Option<usize> {
-    find_byte_simd::<NL_LANES>(b'\n', buffer)
+// SAFETY: buffer must contain a semicolon in the last 8 bytes
+// (buffer may be < 8 bytes, but must contain a semicolon)
+unsafe fn split_at_semicolon_unchecked(buffer: &[u8]) -> (&[u8], &[u8]) {
+    const LANES: usize = 8;
+    const SPLAT: Simd<u8, LANES> = Simd::splat(b';');
+
+    let bytes = if let Some(chunk) = buffer.last_chunk() {
+        Simd::<u8, LANES>::from_array(*chunk)
+    } else {
+        hint::cold_path();
+        Simd::<u8, LANES>::load_or_default(buffer)
+    };
+
+    let set_pos = unsafe { bytes.simd_eq(SPLAT).first_set().unwrap_unchecked() };
+    // there is no Mask::last_set, but we know there's only 1 ;
+    let pos = buffer.len() - LANES + set_pos;
+    let (before, after) = unsafe { buffer.split_at_unchecked(pos + 1) };
+    (&before[..before.len() - 1], after)
 }
 
-fn find_semicolon(buffer: &[u8]) -> Option<usize> {
-    find_byte_simd::<SC_LANES>(b';', buffer)
-}
+pub fn find_newline(mut buffer: &[u8]) -> Option<usize> {
+    const LANES: usize = 32;
+    const SPLAT: Simd<u8, LANES> = Simd::splat(b'\n');
 
-fn find_byte_simd<const LANES: usize>(byte: u8, mut buffer: &[u8]) -> Option<usize>
-where
-    LaneCount<LANES>: SupportedLaneCount,
-{
     let mut i = 0;
     while let Some((chunk, rest)) = buffer.split_first_chunk() {
         let bytes = Simd::<u8, LANES>::from_array(*chunk);
-        let mask = bytes.simd_eq(Simd::splat(byte));
-        if let Some(set) = mask.first_set() {
-            return Some(i + set);
+        let index = bytes.simd_eq(SPLAT).first_set().map(|set| set + i);
+        if index.is_some() {
+            return index;
         }
         i += LANES;
         buffer = rest;
     }
-    hint::cold_path();
-    buffer.iter().position(|&b| b == byte).map(|p| i + p)
+
+    let bytes = Simd::<u8, LANES>::load_or_default(buffer);
+    let mask = bytes.simd_eq(SPLAT);
+    mask.first_set().map(|set| i + set)
 }
 
 /// An iterator over the lines of buf. Uses SIMD to find newlines
-pub struct ByteLines<'a> {
+pub struct ParsedLines<'a> {
     buf: &'a [u8],
 }
 
-impl<'a> ByteLines<'a> {
+impl<'a> ParsedLines<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
         Self { buf }
     }
 }
 
-impl<'a> Iterator for ByteLines<'a> {
-    type Item = &'a [u8];
+impl<'a> Iterator for ParsedLines<'a> {
+    type Item = (&'a [u8], i16);
     fn next(&mut self) -> Option<Self::Item> {
         if self.buf.is_empty() {
+            std::hint::cold_path();
             return None;
         }
 
         let pos = find_newline(self.buf).unwrap_or(self.buf.len() - 1);
+        // SAFETY: pos is guaranteed to be < self.buf.len() so pos + 1 is guaranteed to be <=
+        // self.buf.len()
         let (line, new_buf) = unsafe { self.buf.split_at_unchecked(pos + 1) };
         self.buf = new_buf;
-        Some(line)
+
+        // SAFETY: README promises that every line contains a semicolon
+        let (station, temp_str) = unsafe { split_at_semicolon_unchecked(line) };
+        // SAFETY: pos is guaranteed to be < line.len()
+        Some((station, unsafe { parse_temp_unchecked(temp_str) }))
     }
+}
+
+fn parse_chunk(chunk: &[u8]) -> ParsedLines<'_> {
+    ParsedLines::new(chunk)
 }
 
 #[derive(Debug)]
@@ -97,6 +112,23 @@ pub struct Record {
     sum: i32,
     min: i16,
     max: i16,
+}
+impl AddAssign<&'_ Record> for Record {
+    fn add_assign(&mut self, rhs: &Record) {
+        self.count += rhs.count;
+        self.sum += rhs.sum;
+        // these are sufficiently rare, that the occasional branch misses are actually worth it
+        // compared to a cmov instruction every time
+        if rhs.max > self.max {
+            std::hint::cold_path();
+            self.max = rhs.max;
+        }
+
+        if rhs.min < self.min {
+            std::hint::cold_path();
+            self.min = rhs.min;
+        }
+    }
 }
 
 impl fmt::Display for Record {
@@ -120,15 +152,6 @@ impl From<i16> for Record {
             min: value,
             max: value,
         }
-    }
-}
-
-impl AddAssign<&'_ Record> for Record {
-    fn add_assign(&mut self, rhs: &Record) {
-        self.count += rhs.count;
-        self.sum += rhs.sum;
-        self.min = cmp::min(self.min, rhs.min);
-        self.max = cmp::max(self.max, rhs.max);
     }
 }
 
@@ -161,21 +184,13 @@ unsafe fn parse_temp_unchecked(bytes: &[u8]) -> i16 {
     let dot_pos = 1 + has_two_digits;
     // compiler can't elide this bounds check without a hint for some reason, but this is safe
     // Could do get_unchecked here?
-    let frac_part = (unsafe { num.get_unchecked(dot_pos + 1) } - b'0') as i16;
+    let frac_part = (unsafe { num.get_unchecked(dot_pos + 1) }.wrapping_sub(b'0')) as i16;
     let abs = frac_part + int_part;
 
     hint::select_unpredictable(is_neg, -abs, abs)
 }
 
 /// Given a chunk returns an iterator over (station name, temperature * 10 as i16)
-fn parse_chunk(chunk: &[u8]) -> impl Iterator<Item = (&[u8], i16)> {
-    ByteLines::new(chunk).map(|line| unsafe {
-        let pos = find_semicolon(line).unwrap_unchecked();
-        let (station, temp_str) = line.split_at_unchecked(pos);
-        (station, parse_temp_unchecked(temp_str))
-    })
-}
-
 /// See docstring for worker function for the idea here
 struct ChunkReader {
     file: fs::File,
@@ -289,8 +304,9 @@ fn accumulate_records(
                 None => {
                     // the double hash here is annoying
                     // but it shouldn't happen often
-                    // hashbrown's entry_ref api is a nicer way to express this
-                    records.insert(StationName::new(station), Record::from(temp));
+                    records
+                        .entry(StationName::new(station))
+                        .or_insert(Record::from(temp));
                 }
             };
         }
@@ -302,6 +318,7 @@ fn accumulate_records(
 pub fn process_file(path: &Path) -> io::Result<Vec<(StationName, Record)>> {
     let next_chunk = AtomicU64::new(0);
 
+    //let workers = 1;
     let workers = std::thread::available_parallelism().unwrap().get();
 
     let mut station_data = std::thread::scope(|scope| {

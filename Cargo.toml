@@ -23,3 +23,6 @@ path = "src/lib.rs"
 [[bench]]
 name = "full_bench"
 harness = false
+
+[dependencies]
+hashbrown = "0.16.1"

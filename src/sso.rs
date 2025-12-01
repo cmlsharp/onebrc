@@ -6,19 +6,30 @@ use std::{
 };
 const SMALL_SIZE: usize = std::mem::size_of::<AllocedSsoVec>();
 
-#[cfg(target_endian = "big")]
-compile_error!("this implementation assumes little endian");
-
 #[repr(C)]
 pub union SsoVec {
     local: LocalSsoVec,
     alloc: ManuallyDrop<AllocedSsoVec>,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LocalSsoVec {
+    data: MaybeUninit<[u8; SMALL_SIZE - 1]>,
+    len: u8,
+}
+
+#[repr(C)]
+struct AllocedSsoVec {
+    ptr: *mut u8,
+    // INVARIANT: len fits in size_of::<usize>() - 1 bytes
+    len: usize,
+}
+
 impl SsoVec {
     #[inline]
     pub fn new(s: &[u8]) -> Self {
-        debug_assert!(s.len() < usize::MAX / 2);
+        // INVARIANT: s's length fits into size_of::<usize>() - 1 bytes
         if s.len() < SMALL_SIZE {
             Self {
                 local: LocalSsoVec::new(s),
@@ -32,7 +43,7 @@ impl SsoVec {
     }
 
     fn is_local(&self) -> bool {
-        ((unsafe { self.local.len }) >> 7) & 1 == 0
+        unsafe { self.local.len != 0 }
     }
 
     pub unsafe fn as_str_unchecked(&self) -> &str {
@@ -55,13 +66,6 @@ impl From<&[u8]> for SsoVec {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct LocalSsoVec {
-    data: MaybeUninit<[u8; SMALL_SIZE - 1]>,
-    len: u8,
-}
-
 impl LocalSsoVec {
     fn new(data: &[u8]) -> Self {
         assert!(data.len() < SMALL_SIZE);
@@ -72,11 +76,11 @@ impl LocalSsoVec {
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ret.data.as_mut_ptr().cast(), data.len())
         };
-        ret.len = data.len() as u8;
+        ret.len = data.len() as u8 + 1;
         ret
     }
     fn len(&self) -> usize {
-        usize::from(self.len)
+        usize::from(self.len - 1)
     }
 }
 
@@ -86,22 +90,16 @@ impl AsRef<[u8]> for LocalSsoVec {
     }
 }
 
-#[repr(C)]
-struct AllocedSsoVec {
-    ptr: *mut u8,
-    len: usize,
-}
-
 impl AllocedSsoVec {
     fn new(alloc: Box<[u8]>) -> Self {
         let ptr = Box::into_raw(alloc);
         Self {
-            len: ptr.len() | (1 << (usize::BITS - 1)),
+            len: ptr.len().to_le(),
             ptr: ptr.cast(),
         }
     }
     fn len(&self) -> usize {
-        self.len & !(1 << (usize::BITS - 1))
+        usize::from_le(self.len)
     }
 }
 

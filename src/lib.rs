@@ -32,7 +32,7 @@ const INIT_CAPACITY: usize = 1024;
 pub type StationName = sso::SsoVec;
 
 #[derive(Default)]
-pub struct FastHasher {
+struct FastHasher {
     accumulator: u64,
 }
 
@@ -87,7 +87,7 @@ unsafe fn split_at_semicolon_unchecked(buffer: &[u8]) -> (&[u8], &[u8]) {
     (&before[..before.len() - 1], after)
 }
 
-pub fn find_newline(mut buffer: &[u8]) -> Option<usize> {
+fn find_newline(mut buffer: &[u8]) -> Option<usize> {
     const LANES: usize = 32;
     const SPLAT: Simd<u8, LANES> = Simd::splat(b'\n');
 
@@ -108,17 +108,17 @@ pub fn find_newline(mut buffer: &[u8]) -> Option<usize> {
 }
 
 /// An iterator over the lines of buf. Uses SIMD to find newlines
-pub struct ParsedLines<'a> {
+struct ChunkParser<'a> {
     buf: &'a [u8],
 }
 
-impl<'a> ParsedLines<'a> {
-    pub fn new(buf: &'a [u8]) -> Self {
+impl<'a> ChunkParser<'a> {
+    fn new(buf: &'a [u8]) -> Self {
         Self { buf }
     }
 }
 
-impl<'a> Iterator for ParsedLines<'a> {
+impl<'a> Iterator for ChunkParser<'a> {
     type Item = (&'a [u8], i16);
     fn next(&mut self) -> Option<Self::Item> {
         if self.buf.is_empty() {
@@ -139,10 +139,6 @@ impl<'a> Iterator for ParsedLines<'a> {
     }
 }
 
-fn parse_chunk(chunk: &[u8]) -> ParsedLines<'_> {
-    ParsedLines::new(chunk)
-}
-
 #[derive(Debug)]
 pub struct Record {
     count: usize,
@@ -150,7 +146,7 @@ pub struct Record {
     min: i16,
     max: i16,
 }
-impl AddAssign<&'_ Record> for Record {
+impl AddAssign<&Record> for Record {
     fn add_assign(&mut self, rhs: &Record) {
         self.count += rhs.count;
         self.sum += rhs.sum;
@@ -291,37 +287,29 @@ impl ChunkReader {
             find_newline(&chunk[Self::CHUNK_SIZE..]).unwrap() + Self::CHUNK_SIZE + 1
         };
 
-        &chunk[start..end]
+        unsafe { chunk.get_unchecked(start..end) }
     }
 }
 
-/// This is kind of an ultra simple work-stealing queue
-/// Workers share an atomic counter of claimed chunks into the file. They 'claim' a chunk by
-/// performing a fetch_add instruction on it, incrementing the counter. Then they begin the chunk
-/// at chunk_start := CHUNK_SIZE * chunk_index. unfortunately chunks often start in the middle of a line
-/// so instead of reading CHUNK_SIZE bytes, each worker actually reads CHUNK_SIZE + CHUNK_OVERLAP
-/// bytes to ensure they can start and stop at newlines
-///
-/// Aside from edge cases of first and last chunk, the anatomy of a chunk looks like:
-///
-/// |_ _ _ _ \n _ _ _ _ _ _ _ \n _ ... _ _ \n _ _ _ _ \n _ _ _ _ _ |
-/// ^           |                               |      |           |
-/// |           |                               |      |           | - chunk_start + CHUNK_SIZE + CHUNK_OVERLAP
-/// |           |                               |      |
-/// |           |                               |      |
-/// |           | - start reading               |      | - stop reading
-/// |- chunk_start                              |- chunk_start + CHUNK_SIZE
-///
-/// Each worker accumulates a HashMap<Box<[u8]>, Record> which are then merged later
-/// The nature of this challenge is that there aren't that many unique stations so boxing them
-/// probably isn't that bad. If there were a lot, I'd consider arena allocation
+fn insert_record(station: &[u8], temp: i16, records: &mut HashMap<StationName, Record>) {
+    match records.get_mut(station) {
+        Some(stats) => {
+            *stats += temp;
+        }
+        None => {
+            // the double hash here is annoying
+            // but it shouldn't happen often
+            records
+                .entry(StationName::new(station))
+                .or_insert(Record::from(temp));
+        }
+    };
+}
+
 fn accumulate_records(
     path: &Path,
     next_chunk: &AtomicU64,
 ) -> io::Result<HashMap<StationName, Record>> {
-    // you would think this would be a classic use case for all threads to share a file descriptor
-    // and use pread (via std::os::unix::fs::FileExt::read_exact_at), but it's faster to open a new
-    // file descriptor in each thread. I guess it's a contention issue
     let mut records = HashMap::with_capacity_and_hasher(INIT_CAPACITY, Default::default());
     let mut reader = ChunkReader::new(path)?;
 
@@ -331,19 +319,8 @@ fn accumulate_records(
     // (at least for current chunk sizes)
     let get_next = || next_chunk.fetch_add(1, Ordering::Relaxed) as usize;
     while let Some(chunk) = reader.read_chunk(get_next())? {
-        for (station, temp) in parse_chunk(chunk) {
-            match records.get_mut(station) {
-                Some(stats) => {
-                    *stats += temp;
-                }
-                None => {
-                    // the double hash here is annoying
-                    // but it shouldn't happen often
-                    records
-                        .entry(StationName::new(station))
-                        .or_insert(Record::from(temp));
-                }
-            };
+        for (station, temp) in ChunkParser::new(chunk) {
+            insert_record(station, temp, &mut records)
         }
     }
 

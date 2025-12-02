@@ -278,9 +278,8 @@ impl ChunkReader {
             find_newline(chunk).unwrap() + 1
         };
 
-        let is_last_chunk = chunk_size < chunk.len();
-
-        let end = if is_last_chunk {
+        let end = if chunk_size < chunk.len() {
+            // this occurs when this is the last chunk and chunk size doesn't divide file size
             hint::cold_path();
             chunk_size
         } else {
@@ -299,9 +298,9 @@ fn insert_record(station: &[u8], temp: i16, records: &mut HashMap<StationName, R
         None => {
             // the double hash here is annoying
             // but it shouldn't happen often
-            records
-                .entry(StationName::new(station))
-                .or_insert(Record::from(temp));
+            // without an entry_ref api the alternative is entry()
+            // which takes keys by value, hence requiring allocations even in the happy path
+            records.insert(StationName::new(station), Record::from(temp));
         }
     };
 }
@@ -364,4 +363,15 @@ pub fn process_file(path: &Path) -> io::Result<Vec<(StationName, Record)>> {
     });
     println!("{:?}", COUNTER.load(Ordering::Relaxed));
     Ok(station_data)
+}
+
+pub fn print(data: &[(StationName, Record)]) -> io::Result<()> {
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    write!(stdout, "{{")?;
+    for (k, v) in data {
+        write!(stdout, "{}={v}, ", unsafe { k.as_str_unchecked() })?;
+    }
+    write!(stdout, "}}")?;
+    stdout.flush()?;
+    Ok(())
 }

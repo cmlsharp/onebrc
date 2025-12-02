@@ -41,8 +41,6 @@ impl FastHasher {
     const SEED: u64 = 0x13198a2e03707344;
 }
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
 impl Hasher for FastHasher {
     fn finish(&self) -> u64 {
         self.accumulator.rotate_left(26)
@@ -361,7 +359,6 @@ pub fn process_file(path: &Path) -> io::Result<Vec<(StationName, Record)>> {
     station_data.sort_unstable_by(|(k1, _), (k2, _)| unsafe {
         k1.as_str_unchecked().cmp(k2.as_str_unchecked())
     });
-    println!("{:?}", COUNTER.load(Ordering::Relaxed));
     Ok(station_data)
 }
 

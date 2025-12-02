@@ -1,9 +1,11 @@
 #![feature(portable_simd)]
 #![feature(cold_path)]
-#![feature(iter_array_chunks)]
+#![feature(hasher_prefixfree_extras)]
 
 use std::{
-    cmp, fmt, fs, hint,
+    cmp, fmt, fs,
+    hash::{BuildHasherDefault, Hasher},
+    hint,
     io::{self, prelude::*},
     ops::AddAssign,
     path::Path,
@@ -14,7 +16,6 @@ use std::{
     },
 };
 
-mod hasher;
 mod sso;
 
 // station name: max is 100 bytes per the rules
@@ -22,13 +23,49 @@ mod sso;
 // + 5 for -xx.x
 const MAX_LINE_LEN: usize = 100 + 1 + 5;
 
-type HashMap<K, V> = std::collections::HashMap<K, V, hasher::BuildFastHasher>;
+type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FastHasher>>;
 
 // used to set initial capacities for hash tables
 const INIT_CAPACITY: usize = 1024;
 
 // small string optimization byte string
 pub type StationName = sso::SsoVec;
+
+#[derive(Default)]
+pub struct FastHasher {
+    accumulator: u64,
+}
+
+impl FastHasher {
+    const K: u64 = 0xf1357aea2e62a9c5;
+    const SEED: u64 = 0x13198a2e03707344;
+}
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+impl Hasher for FastHasher {
+    fn finish(&self) -> u64 {
+        self.accumulator.rotate_left(26)
+    }
+
+    fn write_length_prefix(&mut self, _len: usize) {}
+
+    fn write(&mut self, bytes: &[u8]) {
+        let len = bytes.len();
+        // SAFETY: README promises station name lengths will be > 0
+        unsafe { std::hint::assert_unchecked(len > 0) }
+
+        let acc = Self::SEED
+            ^ if len >= 4 {
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            } else {
+                hint::cold_path();
+                u32::from_le_bytes([bytes[0], bytes[len / 2], bytes[len - 1], 0])
+            } as u64;
+
+        self.accumulator = self.accumulator.wrapping_add(acc).wrapping_mul(Self::K);
+    }
+}
 
 // SAFETY: buffer must contain a semicolon in the last 8 bytes
 // (buffer may be < 8 bytes, but must contain a semicolon)
@@ -191,7 +228,6 @@ unsafe fn parse_temp_unchecked(bytes: &[u8]) -> i16 {
 }
 
 /// Given a chunk returns an iterator over (station name, temperature * 10 as i16)
-/// See docstring for worker function for the idea here
 struct ChunkReader {
     file: fs::File,
     file_len: u64,
@@ -204,7 +240,7 @@ impl ChunkReader {
     // generally in the range of what seems to be optimal
     const CHUNK_SIZE: usize = 1 << 16;
     // Needs to be at least as large as the longest line in the input file
-    const CHUNK_OVERLAP: usize = MAX_LINE_LEN;
+    const OVERLAP: usize = MAX_LINE_LEN;
     fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = fs::File::open(path)?;
         let file_len = file.metadata().unwrap().len();
@@ -212,7 +248,7 @@ impl ChunkReader {
             file,
             file_len,
             num_chunks: file_len.div_ceil(Self::CHUNK_SIZE as u64) as usize,
-            buffer: vec![0; Self::CHUNK_SIZE + Self::CHUNK_OVERLAP],
+            buffer: vec![0; Self::CHUNK_SIZE + Self::OVERLAP],
         })
     }
 
@@ -233,7 +269,6 @@ impl ChunkReader {
         )))
     }
 
-    // helper method
     // extracts chunk from self.buffer
     // for chunks after the first one, we seek to the first newline
     // for chunks besides the last one, we read forward after CHUNK_SIZE until
@@ -318,8 +353,10 @@ fn accumulate_records(
 pub fn process_file(path: &Path) -> io::Result<Vec<(StationName, Record)>> {
     let next_chunk = AtomicU64::new(0);
 
-    //let workers = 1;
-    let workers = std::thread::available_parallelism().unwrap().get();
+    let workers = std::env::var("ONEBRC_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().unwrap().get());
 
     let mut station_data = std::thread::scope(|scope| {
         let (tx, rx) = mpsc::sync_channel(workers);
@@ -348,5 +385,6 @@ pub fn process_file(path: &Path) -> io::Result<Vec<(StationName, Record)>> {
     station_data.sort_unstable_by(|(k1, _), (k2, _)| unsafe {
         k1.as_str_unchecked().cmp(k2.as_str_unchecked())
     });
+    println!("{:?}", COUNTER.load(Ordering::Relaxed));
     Ok(station_data)
 }

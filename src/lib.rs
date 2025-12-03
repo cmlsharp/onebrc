@@ -69,16 +69,22 @@ unsafe fn split_at_semicolon_unchecked(buffer: &[u8]) -> (&[u8], &[u8]) {
     const LANES: usize = 8;
     const SPLAT: Simd<u8, LANES> = Simd::splat(b';');
 
-    let bytes = if let Some(chunk) = buffer.last_chunk() {
-        Simd::<u8, LANES>::from_array(*chunk)
+    let pos = if let Some(chunk) = buffer.last_chunk() {
+        let bytes = Simd::<u8, LANES>::from_array(*chunk);
+        let set_pos = unsafe { bytes.simd_eq(SPLAT).first_set().unwrap_unchecked() };
+        // there is no Mask::last_set, but we know there's only 1 ;
+        buffer.len() - LANES + set_pos
     } else {
         hint::cold_path();
-        Simd::<u8, LANES>::load_or_default(buffer)
-    };
+        unsafe {
+            let mut i = buffer.len() - 4;
 
-    let set_pos = unsafe { bytes.simd_eq(SPLAT).first_set().unwrap_unchecked() };
-    // there is no Mask::last_set, but we know there's only 1 ;
-    let pos = buffer.len() - LANES + set_pos;
+            while *buffer.get_unchecked(i) != b';' {
+                i -= 1;
+            }
+            i
+        }
+    };
     let (before, after) = unsafe { buffer.split_at_unchecked(pos + 1) };
     (&before[..before.len() - 1], after)
 }
